@@ -1,0 +1,18 @@
+<div class="grid md:grid-cols-4 gap-3">
+  <div class="bg-slate-900 border border-slate-700 rounded p-3">
+    <div class="text-slate-400 text-xs">Mode</div>
+    <div class="text-lg font-semibold">{{ status.mode }}</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-700 rounded p-3">
+    <div class="text-slate-400 text-xs">Balance</div>
+    <div id="balance-pill" class="text-2xl font-bold text-emerald-300">{{ "%.2f"|format(status.balance) }}</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-700 rounded p-3">
+    <div class="text-slate-400 text-xs">PNL</div>
+    <div id="pnl-pill" class="text-2xl font-bold {% if status.pnl >= 0 %}text-emerald-400{% else %}text-rose-400{% endif %}">{{ "%.2f"|format(status.pnl * 100) }}%</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-700 rounded p-3">
+    <div class="text-slate-400 text-xs">Latency</div>
+    <div class="text-lg">{{ "%.1f"|format(status.latency_ms) }} ms</div>
+  </div>
+</div>
