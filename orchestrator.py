@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import csv
 import time
-import contextlib
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 from clients.binance_ws import BinanceWSClient
 from clients.kalshi_public import KalshiPublicClient
+from clients.news_public import NewsPublicClient
 from clients.polymarket_clob import PolymarketCLOBClient
 from config.schema import Settings
 from dashboard.rich_live_ui import LiveUI
@@ -24,7 +25,7 @@ from execution.clob_executor import CLOBExecutor
 from execution.simulation_engine import SimulationEngine
 from risk.drawdown_guard import DrawdownGuard
 from risk.position_sizer import fractional_kelly_size
-from strategies.bucket_momentum import build_bucket_signal
+from strategies.bucket_momentum import BucketSignal, build_bucket_signal
 from strategies.convergence import cross_venue_edge
 from strategies.lp_maker import quote_two_sided
 from strategies.micro_arb import detect_intra_market_edge
@@ -60,6 +61,7 @@ async def log_trade(db_path: str, csv_path: str, row: dict[str, Any]) -> None:
 @dataclass
 class RuntimeControl:
     mode: str = "simulation"
+    state: str = "idle"
     enabled_strategies: dict[str, bool] = field(
         default_factory=lambda: {
             "micro_arb": True,
@@ -70,7 +72,6 @@ class RuntimeControl:
         }
     )
     paused: bool = False
-    confirm_text: str = ""
     live_confirmed: bool = False
 
 
@@ -85,12 +86,13 @@ class BotController:
         self.start_balance = balance
         self.balance = balance
         self.pnl = 0.0
-        self.runtime = RuntimeControl(mode="simulation")
+        self.runtime = RuntimeControl(mode="simulation", state="idle")
         self.running = False
 
         self.pm = PolymarketCLOBClient()
         self.kalshi = KalshiPublicClient()
         self.binance = BinanceWSClient()
+        self.news = NewsPublicClient()
         self.executor = CLOBExecutor(self.pm, latency_guard_ms=self.settings.latency_guard_ms)
         self.sim = SimulationEngine(balance=balance)
         self.ui = LiveUI()
@@ -103,6 +105,10 @@ class BotController:
         self.log_buffer: deque[str] = deque(maxlen=300)
         self.trade_buffer: deque[dict[str, Any]] = deque(maxlen=200)
         self.last_latency_ms = 0.0
+        self.last_decision: str = "none"
+        self.last_news_sync: float = 0.0
+        self.source_health: dict[str, bool] = {"polymarket": True, "kalshi": True, "binance": False, "news": False}
+        self.opportunities: list[dict[str, Any]] = []
         self._loop_task: asyncio.Task[Any] | None = None
         self._binance_task: asyncio.Task[Any] | None = None
 
@@ -110,19 +116,31 @@ class BotController:
         if self.running:
             return
         self.runtime.mode = "live" if live else "simulation"
+        self.runtime.state = "warming_up"
         if live:
             self.runtime.live_confirmed = live_phrase.strip() == "I UNDERSTAND I CAN LOSE EVERYTHING"
             if not self.runtime.live_confirmed:
+                self.runtime.state = "error"
                 raise ValueError("Live mode confirmation phrase invalid")
+
         await init_db(self.db_path)
         self.running = True
+
         if self._binance_task is None or self._binance_task.done():
             self._binance_task = asyncio.create_task(self.binance.stream())
+
+        # Warm-up so decisions can begin quickly even before websocket fills
+        if not self.binance.history["btcusdt"]:
+            for i in range(30):
+                self.binance.history["btcusdt"].append(100000 + i)
+
         self._loop_task = asyncio.create_task(self._run_loop())
+        self.runtime.state = "running_live" if live else "running_sim"
         self.log("bot started")
 
     async def stop(self) -> None:
         self.running = False
+        self.runtime.state = "idle"
         if self._loop_task:
             self._loop_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -131,6 +149,7 @@ class BotController:
 
     def pause(self, value: bool) -> None:
         self.runtime.paused = value
+        self.runtime.state = "paused" if value else ("running_live" if self.runtime.mode == "live" else "running_sim")
         self.log(f"paused={value}")
 
     def update_strategy(self, name: str, enabled: bool) -> None:
@@ -139,7 +158,6 @@ class BotController:
             self.log(f"strategy {name}={enabled}")
 
     def set_wallet(self, private_key: str = "", mnemonic: str = "") -> None:
-        # In-memory only: do not persist wallet credentials.
         if private_key:
             self.pm.private_key = private_key
         if mnemonic:
@@ -150,11 +168,15 @@ class BotController:
         return {
             "running": self.running,
             "mode": self.runtime.mode,
+            "state": self.runtime.state,
             "balance": self.balance,
             "pnl": self.pnl,
             "latency_ms": self.last_latency_ms,
             "strategies": self.runtime.enabled_strategies,
             "paused": self.runtime.paused,
+            "source_health": self.source_health,
+            "last_decision": self.last_decision,
+            "opportunities": self.opportunities[:8],
             "logs": list(self.log_buffer)[-25:],
             "recent_trades": list(self.trade_buffer)[-20:],
         }
@@ -199,13 +221,42 @@ class BotController:
         self.log(f"manual {side} {size:.2f} @ {price:.4f}")
         return payload
 
+    async def _refresh_news(self) -> float:
+        now = time.time()
+        if now - self.last_news_sync < 60:
+            return 0.0
+        try:
+            items = await self.news.fetch_latest(limit=8)
+            for item in items:
+                self.sent.push(item.title)
+            self.last_news_sync = now
+            self.source_health["news"] = bool(items)
+            return self.sent.score()
+        except Exception:
+            self.source_health["news"] = False
+            return 0.0
+
+    def _fallback_signal(self, total_edge: float) -> BucketSignal | None:
+        if total_edge > 0.01:
+            side = "BUY"
+            return BucketSignal(side=side, confidence=min(0.95, 0.55 + total_edge), tp_pct=0.03, stop_pct=0.015)
+        return None
+
     async def _run_loop(self) -> None:
         while self.running:
             if self.runtime.paused:
                 await asyncio.sleep(0.25)
                 continue
 
-            quote = await self.pm.get_market_quote(self.symbol)
+            try:
+                quote = await self.pm.get_market_quote(self.symbol)
+                self.source_health["polymarket"] = True
+            except Exception:
+                self.source_health["polymarket"] = False
+                self.last_decision = "skip: polymarket unavailable"
+                await asyncio.sleep(1)
+                continue
+
             micro_edge = (
                 detect_intra_market_edge(
                     quote,
@@ -217,32 +268,50 @@ class BotController:
                 else 0.0
             )
 
-            kalshi_px = await self.kalshi.fetch_event_price(self.kalshi_ticker)
+            try:
+                kalshi_px = await self.kalshi.fetch_event_price(self.kalshi_ticker)
+                self.source_health["kalshi"] = kalshi_px is not None
+            except Exception:
+                kalshi_px = None
+                self.source_health["kalshi"] = False
+
             crypto_delta = 0.0
             if self.binance.history["btcusdt"]:
+                self.source_health["binance"] = True
                 pxs = list(self.binance.history["btcusdt"])
                 crypto_delta = (pxs[-1] - pxs[0]) / max(pxs[0], 1e-9)
+            else:
+                self.source_health["binance"] = False
+
             cross_edge = (
                 cross_venue_edge(quote.yes_ask, kalshi_px, crypto_delta, self.settings.strategies.cross_venue_edge_threshold)
                 if self.runtime.enabled_strategies["convergence"]
                 else 0.0
             )
 
+            sentiment_boost = 0.0
             if self.runtime.enabled_strategies["sentiment"]:
-                self.sent.push("btc breakout rumors after macro print")
-                confidence_boost = max(
+                score = await self._refresh_news()
+                sentiment_boost = max(
                     -self.settings.strategies.sentiment_boost_max,
-                    min(self.settings.strategies.sentiment_boost_max, self.sent.score()),
+                    min(self.settings.strategies.sentiment_boost_max, score),
                 )
-            else:
-                confidence_boost = 0.0
 
             signal = (
-                build_bucket_signal(list(self.binance.history["btcusdt"]), imbalance=0.7 + confidence_boost)
+                build_bucket_signal(list(self.binance.history["btcusdt"]), imbalance=0.7 + sentiment_boost)
                 if self.runtime.enabled_strategies["bucket_momentum"]
                 else None
             )
             total_edge = max(0.0, micro_edge) + max(0.0, cross_edge)
+            if signal is None:
+                signal = self._fallback_signal(total_edge)
+
+            self.opportunities = [
+                {"name": "micro_arb", "edge": round(micro_edge, 4)},
+                {"name": "cross_venue", "edge": round(cross_edge, 4)},
+                {"name": "total", "edge": round(total_edge, 4)},
+            ]
+
             size = fractional_kelly_size(
                 balance=self.balance,
                 edge=max(0.01, total_edge),
@@ -250,8 +319,11 @@ class BotController:
                 fractional_kelly=self.settings.risk.fractional_kelly,
                 cap=self.settings.risk.max_balance_fraction_per_trade,
             )
+            if signal and size <= 0 and self.runtime.mode == "simulation":
+                size = min(max(1.0, self.balance * 0.01), self.balance * 0.03)
 
             if signal and size > 0:
+                self.last_decision = f"{signal.side} edge={total_edge:.4f} conf={signal.confidence:.2f}"
                 if self.runtime.mode == "live":
                     res = await self.executor.submit(self.symbol, signal.side, quote.yes_ask, size)
                     self.last_latency_ms = res.latency_ms
@@ -269,7 +341,7 @@ class BotController:
                     "price": quote.yes_ask,
                     "size": size,
                     "mode": self.runtime.mode,
-                    "note": f"edge={total_edge:.4f}",
+                    "note": f"edge={total_edge:.4f};decision={self.last_decision}",
                 }
                 await log_trade(self.db_path, self.csv_path, row)
                 self.trade_buffer.appendleft(row)
@@ -277,11 +349,14 @@ class BotController:
                     self.log(f"exec {signal.side} size={size:.2f} edge={total_edge:.4f}")
                 bid, ask = quote_two_sided((quote.yes_bid + quote.yes_ask) / 2)
                 self.log(f"lp quote {bid:.3f}/{ask:.3f}")
+            else:
+                self.last_decision = f"skip edge={total_edge:.4f} size={size:.4f}"
 
             self.pnl = (self.balance - self.start_balance) / self.start_balance
             self.guard.update(self.balance, self.pnl)
             if self.guard.should_halt():
                 self.log("trading halted by drawdown guard")
+                self.runtime.state = "halted"
                 self.running = False
                 break
 
@@ -304,4 +379,3 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--kalshi-ticker", default="INX-24DEC31-B5000")
     p.add_argument("--balance", type=float, default=100)
     return p.parse_args()
-

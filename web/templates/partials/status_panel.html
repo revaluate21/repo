@@ -1,7 +1,7 @@
-<div class="grid md:grid-cols-4 gap-3">
+<div class="grid md:grid-cols-4 gap-3 mb-3">
   <div class="bg-slate-900 border border-slate-700 rounded p-3">
-    <div class="text-slate-400 text-xs">Mode</div>
-    <div class="text-lg font-semibold">{{ status.mode }}</div>
+    <div class="text-slate-400 text-xs">Mode / State</div>
+    <div class="text-lg font-semibold">{{ status.mode }} / {{ status.state }}</div>
   </div>
   <div class="bg-slate-900 border border-slate-700 rounded p-3">
     <div class="text-slate-400 text-xs">Balance</div>
@@ -14,5 +14,26 @@
   <div class="bg-slate-900 border border-slate-700 rounded p-3">
     <div class="text-slate-400 text-xs">Latency</div>
     <div class="text-lg">{{ "%.1f"|format(status.latency_ms) }} ms</div>
+  </div>
+</div>
+
+<div class="grid md:grid-cols-2 gap-3">
+  <div class="bg-slate-900 border border-slate-700 rounded p-3">
+    <div class="text-slate-400 text-xs mb-1">Source Health</div>
+    <div class="text-sm space-y-1">
+      {% for k, v in status.source_health.items() %}
+      <div>{{ k }}: <span class="{% if v %}text-emerald-400{% else %}text-rose-400{% endif %}">{{ 'ok' if v else 'down' }}</span></div>
+      {% endfor %}
+    </div>
+  </div>
+  <div class="bg-slate-900 border border-slate-700 rounded p-3">
+    <div class="text-slate-400 text-xs mb-1">Last Decision</div>
+    <div class="text-sm">{{ status.last_decision }}</div>
+    <div class="text-slate-400 text-xs mt-2">Edges</div>
+    <div class="text-sm">
+      {% for item in status.opportunities %}
+      <div>{{ item.name }}: {{ "%.4f"|format(item.edge) }}</div>
+      {% endfor %}
+    </div>
   </div>
 </div>
